@@ -30,27 +30,35 @@ external auth layer:
 
 ## How the build works
 
-`.github/workflows/build.yml` (weekly cron + manual `workflow_dispatch`):
+`.github/workflows/build.yml` runs weekly (Sun 04:00 UTC) + manual `workflow_dispatch` + `push` to
+`master` that touches the workflow. It has **3 jobs**:
 
-1. Reads the latest Stirling-PDF release tag (GitHub API).
-2. Skips if that version tag already exists on Docker Hub (unless manually dispatched).
-3. `actions/checkout` of **Stirling-Tools/Stirling-PDF at that release tag**.
-4. Builds their **official** `docker/embedded/Dockerfile` with
-   `--build-arg STIRLING_FLAVOR=core --build-arg VERSION_TAG=<version>`.
-5. Pushes `cateim/stirling-pdf:<version>` and `:latest` for **linux/arm64**.
+1. **prepare** (no secrets) — reads the latest release tag (GitHub API), validates it, and decides
+   whether to build (skips if the version tag already exists on Docker Hub, unless manually dispatched).
+2. **build** (matrix `amd64` + `arm64`) — `actions/checkout` of Stirling-Tools/Stirling-PDF **at that
+   tag** and builds their **official** `docker/embedded/Dockerfile` with
+   `--build-arg STIRLING_FLAVOR=core --build-arg VERSION_TAG=<version>`; each arch is pushed **by digest**.
+3. **merge** — combines the per-arch digests into a multi-arch manifest tagged `:<version>` + `:latest`.
 
 We ship **no Dockerfile of our own** — reusing upstream's means base-image bumps and dependency
 changes are inherited automatically; we only flip the flavor.
 
-- **Runner:** `ubuntu-24.04-arm` (free native arm64 for **public** repos). The build is heavy
-  (JDK 25 + Gradle + React frontend); native arm64 avoids painfully slow QEMU emulation.
-- **Target arch:** arm64 only (the deploy host is an Orange Pi 5). Add `linux/amd64` later if needed.
+- **Runners:** `ubuntu-24.04-arm` (arm64) + `ubuntu-latest` (amd64) — both free for **public** repos.
+  Native per-arch builds avoid slow QEMU (the build is heavy: JDK 25 + Gradle + React frontend).
+- **Target arch:** **linux/amd64 + linux/arm64** (multi-arch). Deploy host is an Orange Pi 5 (arm64).
+- **Pipeline security:** third-party actions are **pinned to commit SHA** (Dependabot keeps them
+  current via `.github/dependabot.yml`); `permissions: contents: read`; `persist-credentials: false`;
+  `push` scoped to `master`. Accepted trust boundary: we build arbitrary upstream code weekly — a
+  compromised upstream yields a compromised image. The Dockerfile `RUN` steps run in the BuildKit
+  sandbox (no access to the runner's Docker Hub token); scope the token to this single repo (Read+Write)
+  to bound blast radius.
 
 ## Setup (one-time)
 
-- Repo must be **public** (for the free arm64 runner).
-- Actions secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN` (a Docker Hub access token).
-- Trigger the first build via **Actions → Docker Publish → Run workflow**.
+- Repo must be **public** (for the free arm64 + amd64 runners).
+- Actions secrets: `DOCKERHUB_USERNAME`, `DOCKERHUB_TOKEN`. Scope the token to the **single repo
+  `cateim/stirling-pdf`, Read & Write** (no Delete/Admin).
+- Trigger the first build via **Actions → Docker Publish → Run workflow** (or push the workflow).
 
 ## Deploy target (the consumer of this image)
 
@@ -58,12 +66,16 @@ The consumer is the sibling **DIY** repo (`.../GitHub/DIY`): guide `docs/stirlin
 `assets/stacks/stirling-pdf.yml`, deployed on an Orange Pi 5 via **Portainer**, data under
 `/srv/pdf`, port `8082`, exposed via **Cloudflare Tunnel** at `pdf.selflabs.org`.
 
-To switch that deploy to THIS image:
+This repo also ships a ready [`docker-compose.yml`](docker-compose.yml) (loopback port, `/srv/pdf`
+data, resource limits, hardening, all core-safe env vars documented). To switch the deploy to THIS
+image (via that compose or the DIY stack):
 
 1. Point the stack `image:` to `cateim/stirling-pdf:latest`.
 2. Put **Cloudflare Access (Google)** in front — the `core` image has no login.
-3. Drop the proprietary-only env (`SECURITY_*`, `MAIL_*`, `DISABLE_ADDITIONAL_FEATURES`) — not
-   applicable without the proprietary module.
+3. Drop proprietary-only env (`SECURITY_ENABLELOGIN`, `SECURITY_OAUTH2_*`, `MAIL_*`,
+   `DISABLE_ADDITIONAL_FEATURES`) — no effect without the proprietary module.
+4. The container runs as **root then drops to UID/GID 1000** (PUID/PGID); `chown -R 1000:1000
+   /srv/pdf`. OCR language data path is `/usr/share/tesseract-ocr/5/tessdata`.
 
 ## Conventions
 
