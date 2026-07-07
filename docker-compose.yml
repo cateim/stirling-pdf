@@ -1,0 +1,195 @@
+# docker-compose.yml — deploy do cateim/stirling-pdf (Stirling-PDF flavor "core", 100% MIT)
+# Imagem MULTI-ARCH (linux/amd64 + linux/arm64).
+#
+# Deploy automático no Portainer (Stacks -> Add stack -> Repository / GitOps):
+#   Repository URL : https://github.com/CaTeIM/stirling-pdf
+#   Compose path   : docker-compose.yml
+#   Automatic updates: ligue (polling ou webhook) + "Re-pull image" -> redeploy sozinho.
+#
+# ANTES do 1o deploy, crie as pastas e ajuste o dono (o app roda como UID/GID 1000):
+#   sudo mkdir -p /srv/pdf/{config,logs,tessdata,customFiles,pipeline}
+#   sudo chown -R 1000:1000 /srv/pdf
+# (passo a passo completo, incluindo OCR em português, no README -> "Preparar o host").
+#
+# ATENCAO: a imagem "core" NAO tem login (o modulo proprietario com SSO/gestao de
+# usuarios e removido). Ela precisa SEMPRE de uma camada de auth externa na frente —
+# Cloudflare Access/Tunnel (recomendado), Authelia, Authentik ou reverse proxy.
+
+services:
+  stirling-pdf:
+    image: cateim/stirling-pdf:latest
+    container_name: stirling-pdf
+    restart: unless-stopped
+
+    # -------------------------------------------------------------------------
+    # Hardening seguro (ativo).
+    # -------------------------------------------------------------------------
+    security_opt:
+      - no-new-privileges:true
+
+    # -------------------------------------------------------------------------
+    # Variaveis de ambiente ATIVAS (core-safe).
+    # -------------------------------------------------------------------------
+    environment:
+      TZ: America/Sao_Paulo               # fuso de Sao Paulo (UTC-3) para logs/agendamentos
+      SYSTEM_DEFAULTLOCALE: pt-BR         # idioma padrao da UI
+      SYSTEM_ENABLEANALYTICS: "false"     # desliga telemetria/analytics
+      SYSTEM_FILEUPLOADLIMIT: "100MB"     # teto de upload (protege a placa de DoS/OOM); "" = sem limite
+      # Casa o heap da JVM com o mem_limit abaixo (evita a JVM dimensionar pelo RAM do host).
+      # Reduza MaxRAMPercentage se LibreOffice/OCR (processos FORA da JVM) faltarem RAM.
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60 -XX:+UseContainerSupport -XX:+ExitOnOutOfMemoryError"
+
+      # --- REFERENCIA (opcional): outras envs core-safe. Descomente para usar. ---
+      # Mapeamento Spring: a chave YAML system.defaultLocale vira SYSTEM_DEFAULTLOCALE
+      # (pontos->_, maiuscula). Listas: use forma indexada, ex. ENDPOINTS_TOREMOVE_0.
+      # NAO defina env do modulo proprietario (SECURITY_ENABLELOGIN, SECURITY_OAUTH2_*,
+      # SECURITY_SAML2_*, MAIL_*, PREMIUM_*, etc.): elas NAO tem efeito no core.
+      # NAO desligue METRICS_ENABLED: o healthcheck usa /api/v1/info/status.
+      #
+      # UI / marca:
+      UI_APPNAMENAVBAR: "Self-Labs PDF"     # nome na aba do navegador (vazio -> "Stirling PDF")
+      UI_LANGUAGES: "pt_BR,en_GB"           # whitelist de idiomas da UI (vazio = todos)
+      UI_LOGOSTYLE: modern                  # classic | modern
+      #
+      # Sistema / comportamento:
+      # SYSTEM_SHOWUPDATE: "false"             # esconde o aviso de "ha atualizacao"
+      # SYSTEM_MAXDPI: "500"                   # DPI maximo em PDF->imagem
+      # SYSTEM_CUSTOMHTMLFILES: "false"        # permite override de templates via /customFiles
+      # SYSTEM_ROOTURIPATH: "/pdf"             # servir sob um subpath (o healthcheck se ajusta)
+      # SERVER_PORT: "8080"                    # porta interna (mude tambem a mapeada acima)
+      #
+      # Superficie de ataque / conteudo (defaults ja SEGUROS — mostrados p/ ciencia):
+      # SYSTEM_ENABLEURLTOPDF: "false"         # URL->PDF tem risco de SSRF; ja vem desligado
+      # SYSTEM_DISABLESANITIZE: "false"        # NAO ligue: desliga a sanitizacao de HTML
+      # SYSTEM_HTML_URLSECURITY_BLOCKPRIVATENETWORKS: "true"   # ja bloqueia redes privadas
+      # SYSTEM_HTML_URLSECURITY_BLOCKCLOUDMETADATA: "true"     # ja bloqueia 169.254.169.254
+      # ENDPOINTS_TOREMOVE_0: "img-to-pdf"     # desativa um endpoint (repita _1, _2, ...)
+      # ENDPOINTS_GROUPSTOREMOVE_0: "LibreOffice"  # desativa um grupo inteiro de ferramentas
+      #
+      # Assinatura de PDF (core-safe; so relevante se usar assinatura/timestamp):
+      # SECURITY_VALIDATION_TRUST_USESYSTEMTRUST: "true"
+      # SECURITY_TIMESTAMP_DEFAULTTSAURL: "http://timestamp.digicert.com"
+      #
+      # Limpeza de temporarios:
+      # SYSTEM_TEMPFILEMANAGEMENT_MAXAGEHOURS: "24"
+      # SYSTEM_TEMPFILEMANAGEMENT_CLEANUPINTERVALMINUTES: "30"
+
+    # -------------------------------------------------------------------------
+    # Volumes (bind em /srv/pdf). Dono deve ser 1000:1000 (ver README).
+    # -------------------------------------------------------------------------
+    volumes:
+      - /srv/pdf/config:/configs                                   # settings.yml + chave/UUID gerados
+      - /srv/pdf/logs:/logs                                        # logs do app
+      - /srv/pdf/tessdata:/usr/share/tesseract-ocr/5/tessdata      # OCR (TESS_BASE_PATH) — por/eng/osd .traineddata
+      - /srv/pdf/customFiles:/customFiles                          # logo/CSS/templates customizados
+      - /srv/pdf/pipeline:/pipeline                                # pipelines/automacao e pastas vigiadas
+      # - /srv/pdf/storage:/storage                                # armazenamento por-usuario (v2) — so com login (nao-core)
+      - /srv/pdf/fonts:/usr/share/fonts/extra                    # fontes extras p/ LibreOffice (CJK etc.)
+
+    # A porta so escuta em LOOPBACK: como a imagem nao tem login, publicar em
+    # 0.0.0.0 exporia o app cru na LAN, contornando o Cloudflare. Assim so quem
+    # esta no proprio host (ex.: cloudflared rodando como servico/host-network)
+    # alcanca :8082.
+    #   -> Se o seu cloudflared for um CONTAINER em bridge, ele nao alcanca
+    #      127.0.0.1. Nesse caso: co-loque o cloudflared na rede pdf-net (abaixo)
+    #      e troque este bloco por `expose: ["8080"]` (sem publicar porta no host),
+    #      OU volte para "8082:8080" se realmente precisar expor no host.
+    ports:
+      - "127.0.0.1:8082:8080"    # host 127.0.0.1:8082 -> container 8080
+
+    # -------------------------------------------------------------------------
+    # Rede dedicada (isola de outros containers do bridge default).
+    # -------------------------------------------------------------------------
+    networks:
+      - pdf-net
+
+    # -------------------------------------------------------------------------
+    # Limites de recurso (Orange Pi 5). Ajuste ao RAM do seu modelo (~75% dele).
+    # Valores abaixo assumem 8 GB / 8 cores (RK3588S).
+    # -------------------------------------------------------------------------
+    mem_limit: 4g
+    memswap_limit: 4g            # = mem_limit -> impede crescer para swap
+    cpus: 4.0                    # deixa 2 cores para host/cloudflared
+    pids_limit: 512              # conversoes forkam gs/soffice/tesseract; limita fork-bomb
+    oom_score_adj: 500           # este container e "vitima preferencial" do OOM antes do host
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    stop_grace_period: 30s       # tempo p/ a JVM e filhos do LibreOffice terminarem limpo
+
+    # A imagem ja traz um HEALTHCHECK (curl no /api/v1/info/status). Sobrescrevemos
+    # so para dar mais folga no cold start da JVM em ARM.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 10 http://localhost:8080/api/v1/info/status | grep -q UP || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 180s         # cold start JVM+Spring Boot em ARM pode passar de 120s
+
+    logging:
+      driver: json-file          # limita o log capturado pelo Docker (nao enche o eMMC/SD)
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    labels:
+      # Opcional: se houver um Watchtower no host, ele auto-atualiza este container
+      # quando a tag :latest mudar no Docker Hub. Inofensivo se nao houver Watchtower.
+      com.centurylinklabs.watchtower.enable: "true"
+
+    # -------------------------------------------------------------------------
+    # Hardening AVANCADO — TESTE antes de ativar (pode quebrar o boot desta imagem).
+    # -------------------------------------------------------------------------
+    # A imagem NAO tem diretiva USER: o PID 1 (tini -> init.sh) inicia como ROOT e
+    # dropa privilegio para 1000:1000 em runtime via PUID/PGID. Por isso:
+    #
+    #  * NAO use `user: "1000:1000"` -> quebra o init.sh (ele faz chown/chmod como root).
+    #    Para rodar nao-root, o caminho suportado e via PUID/PGID (ja sao 1000), nao `user:`.
+    #  * `init: true` e desnecessario -> o ENTRYPOINT ja e o tini.
+    #
+    # cap_drop/cap_add: derruba todas as capabilities e devolve so as que o init.sh
+    # precisa (chown -R, chmod -R, copia do tessdata, drop de privilegio). Ative e
+    # confira os logs; se nao subir, adicione a cap faltante ou comente o bloco.
+    # cap_drop:
+    #   - ALL
+    # cap_add:
+    #   - CHOWN
+    #   - DAC_OVERRIDE
+    #   - FOWNER
+    #   - SETUID
+    #   - SETGID
+    #   - SETPCAP
+    #
+    # read_only rootfs — exige cobrir TODO caminho gravavel com tmpfs/volume:
+    # read_only: true
+    # tmpfs:
+    #   - /tmp:size=512m,mode=1777
+    #   - /home/stirlingpdfuser
+
+networks:
+  pdf-net:
+    name: pdf-net
+    driver: bridge
+    # internal: true   # ligue se co-locar o cloudflared aqui e NAO publicar porta no host
+
+# -----------------------------------------------------------------------------
+# (Opcional) cloudflared no mesmo compose = topologia mais segura: o app fica sem
+# porta publicada no host, acessivel so pelo tunel. Ative com: --profile tunnel
+# e defina TUNNEL_TOKEN. Nesse caso, troque o `ports:` do stirling-pdf por
+# `expose: ["8080"]` e aponte o tunel para http://stirling-pdf:8080.
+# -----------------------------------------------------------------------------
+#  cloudflared:
+#    image: cloudflare/cloudflared:latest
+#    container_name: cloudflared
+#    restart: unless-stopped
+#    profiles: [tunnel]
+#    command: tunnel --no-autoupdate run
+#    environment:
+#      TZ: America/Sao_Paulo
+#      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?defina TUNNEL_TOKEN}
+#    networks:
+#      - pdf-net
+#    depends_on:
+#      stirling-pdf:
+#        condition: service_healthy
