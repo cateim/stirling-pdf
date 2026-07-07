@@ -1,0 +1,133 @@
+name: Docker Publish (Stirling-PDF core/MIT)
+
+# Builda automaticamente o Stirling-PDF no flavor "core" (100% MIT, sem o limite
+# de 5 usuários da edicao proprietaria) e publica no Docker Hub.
+# Nao ha Dockerfile proprio: fazemos checkout do upstream na tag da release e
+# buildamos o Dockerfile OFICIAL deles passando --build-arg STIRLING_FLAVOR=core.
+# Assim o build acompanha o upstream (base image, dependencias) sozinho.
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'   # todo domingo as 04:00 UTC
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/**'
+
+# Menor privilégio possível: este workflow só LÊ este repositório e faz push
+# para o Docker Hub (via secrets). Nunca escreve de volta no repositório.
+permissions:
+  contents: read
+
+# Evita dois builds pesados simultâneos (cron + dispatch + push) disputando a
+# tag :latest. O segundo fica na fila até o primeiro terminar (não cancela).
+concurrency:
+  group: build-stirling-core
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: cateim/stirling-pdf
+  UPSTREAM: Stirling-Tools/Stirling-PDF
+  FLAVOR: core
+
+jobs:
+  build:
+    # Runner arm64 NATIVO (gratis em repositorio publico) -> build sem QEMU,
+    # gerando imagem para o OrangePi 5. Para um repo privado, troque por
+    # 'ubuntu-latest' + setup-qemu-action (bem mais lento) ou um self-hosted arm64.
+    runs-on: ubuntu-24.04-arm
+
+    # Build pesado (JDK 25 + Gradle + React). Teto generoso para não deixar um
+    # job travado consumindo o runner indefinidamente.
+    timeout-minutes: 90
+
+    steps:
+      - name: Descobrir a ultima release do Stirling-PDF
+        id: ver
+        env:
+          # Autentica a chamada à API do GitHub para não esbarrar no limite de
+          # 60 req/h por IP (compartilhado entre runners) das requisições anônimas.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=$(curl -fsSL --max-time 30 --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${UPSTREAM}/releases/latest" | jq -r .tag_name)
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Nao consegui obter a release upstream" >&2; exit 1
+          fi
+          VERSION="${TAG#v}"   # remove o 'v' inicial se existir (v2.14.0 -> 2.14.0)
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Ultima release upstream: $TAG (versao $VERSION)"
+
+      - name: Verificar se a imagem ja existe no Docker Hub
+        id: check
+        env:
+          # Passa a versão via env (não interpola ${{ }} direto no run:) para não
+          # abrir espaço a injeção de shell caso a tag upstream tenha metacaracteres.
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          STATUS=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' \
+            "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}")
+          if [ "$STATUS" = "200" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${VERSION} ja existe no Docker Hub -> pulando build."
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+            echo "Build necessario (tag ${VERSION}, HTTP ${STATUS}, evento ${{ github.event_name }})."
+          fi
+
+      - name: Liberar espaco em disco
+        if: steps.check.outputs.needed == 'true'
+        run: docker system prune -af || true
+
+      - name: Checkout do Stirling-PDF na tag da release
+        if: steps.check.outputs.needed == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.ver.outputs.tag }}
+
+      - name: Docker Buildx
+        if: steps.check.outputs.needed == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login no Docker Hub
+        if: steps.check.outputs.needed == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & push (flavor core = MIT, sem limite, SEM login embutido)
+        if: steps.check.outputs.needed == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/embedded/Dockerfile
+          platforms: linux/arm64
+          build-args: |
+            STIRLING_FLAVOR=core
+            VERSION_TAG=${{ steps.ver.outputs.version }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
+            ${{ env.IMAGE_NAME }}:latest
+          push: true
+          provenance: false
+
+      - name: Resumo da execução
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          NEEDED: ${{ steps.check.outputs.needed }}
+        run: |
+          {
+            echo "### Stirling-PDF core (MIT)"
+            echo ""
+            echo "- Release upstream: \`${TAG}\`"
+            echo "- Versão: \`${VERSION}\`"
+            if [ "$NEEDED" = "true" ]; then
+              echo "- Ação: **build + push** de \`${IMAGE_NAME}:${VERSION}\` + \`:latest\` (linux/arm64)"
+            else
+              echo "- Ação: **pulado** — tag já publicada no Docker Hub"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
