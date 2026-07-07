@@ -1,0 +1,18 @@
+version: 2
+
+# Mantém as GitHub Actions (fixadas em SHA no build.yml) atualizadas.
+# Sem isso, os SHAs pinados nunca receberiam patches de segurança.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: sunday
+    commit-message:
+      prefix: ci
+    open-pull-requests-limit: 5
+    groups:
+      # Junta todos os bumps de action num único PR por semana.
+      github-actions:
+        patterns:
+          - "*"

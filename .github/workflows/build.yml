@@ -1,26 +1,41 @@
 name: Docker Publish (Stirling-PDF core/MIT)
 
 # Builda automaticamente o Stirling-PDF no flavor "core" (100% MIT, sem o limite
-# de 5 usuários da edicao proprietaria) e publica no Docker Hub.
-# Nao ha Dockerfile proprio: fazemos checkout do upstream na tag da release e
-# buildamos o Dockerfile OFICIAL deles passando --build-arg STIRLING_FLAVOR=core.
-# Assim o build acompanha o upstream (base image, dependencias) sozinho.
+# de 5 usuários da edição proprietária) e publica no Docker Hub como imagem
+# MULTI-ARCH (linux/amd64 + linux/arm64).
+#
+# Não há Dockerfile próprio: fazemos checkout do upstream na tag da release e
+# buildamos o Dockerfile OFICIAL deles (docker/embedded/Dockerfile) passando
+# --build-arg STIRLING_FLAVOR=core. Assim o build acompanha o upstream sozinho.
+#
+# Estrutura (3 jobs):
+#   prepare -> descobre a versão e decide se precisa buildar (SEM secrets)
+#   build   -> matrix por arquitetura (amd64 nativo no ubuntu-latest, arm64
+#              nativo no ubuntu-24.04-arm) -> push POR DIGEST (sem tag ainda)
+#   merge   -> junta os digests num manifesto multi-arch com as tags :versão + :latest
+#
+# Nota de confiança (supply chain): buildamos código arbitrário do upstream a cada
+# release; se o Stirling-Tools for comprometido, a imagem resultante também será.
+# Mitigações aqui: token do Docker Hub com escopo mínimo (só este repo, Read+Write),
+# actions fixadas em SHA (Dependabot atualiza), persist-credentials:false, e os
+# passos RUN do Dockerfile rodam em sandbox do BuildKit — sem acesso ao
+# ~/.docker/config.json do runner, então o código do upstream não lê o token.
 
 on:
   schedule:
-    - cron: '0 4 * * 0'   # todo domingo as 04:00 UTC
+    - cron: '0 4 * * 0'   # todo domingo às 04:00 UTC
   workflow_dispatch:
   push:
+    branches: [master]           # só o branch default publica (evita clobber de :latest por branch WIP)
     paths:
       - '.github/workflows/**'
 
-# Menor privilégio possível: este workflow só LÊ este repositório e faz push
-# para o Docker Hub (via secrets). Nunca escreve de volta no repositório.
+# Menor privilégio possível: só LÊ este repositório; o push vai para o Docker Hub
+# via secrets, nunca de volta para o repo.
 permissions:
   contents: read
 
-# Evita dois builds pesados simultâneos (cron + dispatch + push) disputando a
-# tag :latest. O segundo fica na fila até o primeiro terminar (não cancela).
+# Evita dois builds pesados simultâneos disputando a tag :latest (o 2º fica na fila).
 concurrency:
   group: build-stirling-core
   cancel-in-progress: false
@@ -31,103 +46,169 @@ env:
   FLAVOR: core
 
 jobs:
-  build:
-    # Runner arm64 NATIVO (gratis em repositorio publico) -> build sem QEMU,
-    # gerando imagem para o OrangePi 5. Para um repo privado, troque por
-    # 'ubuntu-latest' + setup-qemu-action (bem mais lento) ou um self-hosted arm64.
-    runs-on: ubuntu-24.04-arm
-
-    # Build pesado (JDK 25 + Gradle + React). Teto generoso para não deixar um
-    # job travado consumindo o runner indefinidamente.
-    timeout-minutes: 90
-
+  # ---------------------------------------------------------------------------
+  # 1) Descobre a última release e decide se precisa buildar. SEM secrets.
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      needed:  ${{ steps.decide.outputs.needed }}
+      tag:     ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
     steps:
-      - name: Descobrir a ultima release do Stirling-PDF
+      - name: Descobrir a última release do Stirling-PDF
         id: ver
         env:
-          # Autentica a chamada à API do GitHub para não esbarrar no limite de
-          # 60 req/h por IP (compartilhado entre runners) das requisições anônimas.
+          # Autentica a chamada à API do GitHub (evita o limite de 60 req/h por IP).
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG=$(curl -fsSL --max-time 30 --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/repos/${UPSTREAM}/releases/latest" | jq -r .tag_name)
-          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-            echo "Nao consegui obter a release upstream" >&2; exit 1
-          fi
+          # Valida a tag ANTES de escrevê-la em $GITHUB_OUTPUT: defende contra
+          # injeção de output (tag com \n) e contra um ref malicioso no checkout.
+          case "$TAG" in
+            ''|null)            echo "Não consegui obter a release upstream" >&2; exit 1 ;;
+            *[!A-Za-z0-9._-]*)  echo "Tag upstream com caracteres inesperados: '$TAG'" >&2; exit 1 ;;
+          esac
           VERSION="${TAG#v}"   # remove o 'v' inicial se existir (v2.14.0 -> 2.14.0)
-          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Ultima release upstream: $TAG (versao $VERSION)"
+          printf 'tag=%s\n'     "$TAG"     >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Última release upstream: $TAG (versão $VERSION)"
 
-      - name: Verificar se a imagem ja existe no Docker Hub
-        id: check
+      - name: Verificar se a imagem já existe no Docker Hub
+        id: decide
         env:
-          # Passa a versão via env (não interpola ${{ }} direto no run:) para não
-          # abrir espaço a injeção de shell caso a tag upstream tenha metacaracteres.
+          # Passa a versão via env (não interpola ${{ }} direto no run:).
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           STATUS=$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' \
             "https://hub.docker.com/v2/repositories/${IMAGE_NAME}/tags/${VERSION}")
           if [ "$STATUS" = "200" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "needed=false" >> "$GITHUB_OUTPUT"
-            echo "Tag ${VERSION} ja existe no Docker Hub -> pulando build."
+            echo "Tag ${VERSION} já existe no Docker Hub -> pulando build."
           else
             echo "needed=true" >> "$GITHUB_OUTPUT"
-            echo "Build necessario (tag ${VERSION}, HTTP ${STATUS}, evento ${{ github.event_name }})."
+            echo "Build necessário (tag ${VERSION}, HTTP ${STATUS}, evento ${{ github.event_name }})."
           fi
 
-      - name: Liberar espaco em disco
-        if: steps.check.outputs.needed == 'true'
-        run: docker system prune -af || true
+  # ---------------------------------------------------------------------------
+  # 2) Build nativo por arquitetura -> push POR DIGEST (sem tag ainda).
+  #    amd64 no runner x86 padrão; arm64 no runner arm nativo (sem QEMU).
+  # ---------------------------------------------------------------------------
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.needed == 'true'
+    strategy:
+      fail-fast: false           # se um arch falhar, o outro ainda produz logs completos
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Liberar espaço em disco
+        run: |
+          docker system prune -af || true
+          # Remove SDKs pré-instalados grandes (existem no ubuntu-latest; no-op no arm).
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup 2>/dev/null || true
+          df -h /
 
       - name: Checkout do Stirling-PDF na tag da release
-        if: steps.check.outputs.needed == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ${{ env.UPSTREAM }}
-          ref: ${{ steps.ver.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false   # não injeta o GITHUB_TOKEN no contexto de build
 
       - name: Docker Buildx
-        if: steps.check.outputs.needed == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login no Docker Hub
-        if: steps.check.outputs.needed == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & push (flavor core = MIT, sem limite, SEM login embutido)
-        if: steps.check.outputs.needed == 'true'
-        uses: docker/build-push-action@v6
+      - name: Build & push por digest (${{ matrix.arch }} — flavor core = MIT, SEM login embutido)
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: docker/embedded/Dockerfile
-          platforms: linux/arm64
+          platforms: ${{ matrix.platform }}
           build-args: |
             STIRLING_FLAVOR=core
-            VERSION_TAG=${{ steps.ver.outputs.version }}
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
-            ${{ env.IMAGE_NAME }}:latest
-          push: true
+            VERSION_TAG=${{ needs.prepare.outputs.version }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          # provenance/sbom ficam desligados: attestations viram um índice de manifesto
+          # e conflitam com push-by-digest, quebrando o merge multi-arch do job 3.
           provenance: false
 
-      - name: Resumo da execução
-        env:
-          TAG: ${{ steps.ver.outputs.tag }}
-          VERSION: ${{ steps.ver.outputs.version }}
-          NEEDED: ${{ steps.check.outputs.needed }}
+      - name: Exportar digest
         run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload do digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 3) Junta os digests dos dois arch num manifesto multi-arch com as tags reais.
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.needed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Baixar os digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Criar manifesto multi-arch (:versão + :latest)
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE_NAME}:${VERSION}" \
+            -t "${IMAGE_NAME}:latest" \
+            $(printf "${IMAGE_NAME}@sha256:%s " *)
+
+      - name: Inspecionar e resumir
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}"
           {
-            echo "### Stirling-PDF core (MIT)"
+            echo "### Stirling-PDF core (MIT) — multi-arch publicado"
             echo ""
-            echo "- Release upstream: \`${TAG}\`"
             echo "- Versão: \`${VERSION}\`"
-            if [ "$NEEDED" = "true" ]; then
-              echo "- Ação: **build + push** de \`${IMAGE_NAME}:${VERSION}\` + \`:latest\` (linux/arm64)"
-            else
-              echo "- Ação: **pulado** — tag já publicada no Docker Hub"
-            fi
+            echo "- Tags: \`${IMAGE_NAME}:${VERSION}\` + \`${IMAGE_NAME}:latest\`"
+            echo "- Plataformas: linux/amd64, linux/arm64"
           } >> "$GITHUB_STEP_SUMMARY"
